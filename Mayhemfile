@@ -1,8 +1,8 @@
-project: rnshah9/ctags
+project: ctags
 target: ctags
-tests:
+testsuite:
   - file://Units/parser-puppetManifest.r/puppet-virtualresources.d/input.pp
 
 cmds:
-  - cmd: /repo/ctags @@
+  - cmd: /repo/ctags /test.pp
     filepath: /test.pp
