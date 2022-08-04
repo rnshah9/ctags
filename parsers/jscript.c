@@ -38,6 +38,7 @@
 #include "debug.h"
 #include "entry.h"
 #include "keyword.h"
+#include "numarray.h"
 #include "parse.h"
 #include "read.h"
 #include "routines.h"
@@ -46,7 +47,6 @@
 #include "options.h"
 #include "mbcs.h"
 #include "trace.h"
-#include "strlist.h"
 
 /*
  *	 MACROS
@@ -63,12 +63,6 @@
 /*
  *	 DATA DECLARATIONS
  */
-
-/*
- * Tracks class and function names already created
- */
-static stringList *ClassNames;
-static stringList *FunctionNames;
 
 /*	Used to specify type of keyword.
 */
@@ -130,14 +124,15 @@ typedef enum eTokenType {
 	 * Used only in readTokenFull or lower functions. */
 	TOKEN_ATMARK,
 	TOKEN_BINARY_OPERATOR,
-	TOKEN_ARROW
+	TOKEN_ARROW,
+	TOKEN_DOTS,					/* ... */
 } tokenType;
 
 typedef struct sTokenInfo {
 	tokenType		type;
 	keywordId		keyword;
 	vString *		string;
-	vString *		scope;
+	int				scope;
 	unsigned long 	lineNumber;
 	MIOPos 			filePosition;
 	int				nestLevel;
@@ -173,17 +168,118 @@ typedef enum {
 	JSTAG_COUNT
 } jsKind;
 
+/*
+ * "chain element" role is introduced when adapting the JavaScript parser
+ * to corkAPI.
+ *
+ * In the corkAPI, a cork index returned from makeTagEntry() can
+ * represent a scope of another tag. Let's think about `input-0.js' that
+ * the node command accepts as an input for ctags.
+ *
+ +---+ input-0.js ------------------------------------------------------
+ | 1 | class A {
+ | 2 |    f = function(x) {
+ | 3 |       return x
+ | 4 |    }
+ | 5 | }
+ +---+------------------------------------------------------------------
+ *
+ * The following pseudo C code illustrate the code for
+ * tagging `A' and `f' in input-0.js:
+ +---+------------------------------------------------------------------
+ |   |...
+ |   | tagEntryFor e_for_A, e_for_f;
+ |   | ...
+ |   | int index_for_A = makeTagEntry (&e_for_A);
+ |   | ...
+ |>>>| e_for_f.extensionFields.scopeIndex = index_for_A;
+ |   | ...
+ |   | makeTagEntry (&e_for_f);
+ |   | ...
+ +---+------------------------------------------------------------------
+ *
+ * `index_for_A' represents "A" in "class A".
+ * `f' is defined in `A'. To fill the scope field of the tag for `f',
+ * `scopeIndex' member of the tag is filled with `index_for_A' at line |>>>|.
+ *
+ * If `A' is defined in the input source file, this technique based on
+ * the cork API works fine. However, if `A' is not defined in the input
+ * source file, the technique doesn't work well.
+ +---+ input-1.js -------------------------------------------------------
+ | 1 | import {A} from 'input-0.js';
+ | 2 | A.g = function(x) {
+ | 3 |    return x
+ | 4 | }
+ +---+------------------------------------------------------------------
+ *
+ * In this case, `A' may be defined in input-0.js.
+ * The current implementation of ctags processes file by file; it doesn't
+ * use the knowledge in other input source files than current input source
+ * file. ctags processing input-1.js doesn't know the cork index for `A'.
+ *
+ * When tagging `g' with "function" kind, how can we fill the scope field
+ * of the tag for `g'?
+ *
+ * Here the "chain element" role comes.
+ * This role is used for tagging `z' in "x.y.z" in the case when ctags
+ * doesn't see the definitions for `x' and `y'.
+ * The JavaScript parser makes reference tags for `x' and `'y' with
+ * "chain element" role. makeTagEntry() returns a cork index regardless the
+ * type of tags (definition or reference).
+ * The index for the reference tag for `y' can be used to fill the scope
+ * field of the tag for `z'. The index for `x' can be used to fill the
+ * field for `y'.
+ *
+ * With these trick and technique, the scope field for `g' is filled:
+ +---+ tags for input-1.js ---------------------------------------------
+ | 1 | A	input-1.js	/^A.g = function(x) {$/;"	f	roles:chainElt	extras:reference
+ | 2 | g	input-1.js	/^A.g = function(x) {$/;"	f	scope:function:A	signature:(x)	roles:def
+ +---+------------------------------------------------------------------
+ *
+ * By default, reference tags are not emitted. So non-ctags-expert users may
+ * not see the tag entry for `A'.
+ *
+ * makeJsRefTagsForNameChain() and makeJsTagCommon() implement the trick
+ * and technique.
+ *
+ * Arguable points:
+ *
+ * Is "chain element(chainElt)" suitable name for people familier with JavaScript?
+ *
+ * Kinds assigned to the tag having chainElt role must revised. Eventually
+ * we may need to introduce "unknown" kind like the Python parser. Assigning
+ * "function" kind to `A' in input-1.js is obviously wrong.
+ */
+
+typedef enum {
+	JS_VARIABLE_CHAINELT,
+} jsVariableRole;
+
+typedef enum {
+	JS_CLASS_CHAINELT,
+} jsClassRole;
+
+static roleDefinition JsVariableRoles [] = {
+	{ false, "chainElt", "(EXPERIMENTAL)used as an element in a name chain like a.b.c" },
+};
+
+static roleDefinition JsClassRoles [] = {
+	{ false, "chainElt", "(EXPERIMENTAL)used as an element in a name chain like a.b.c" },
+};
+
 static kindDefinition JsKinds [] = {
-	{ true,  'f', "function",	  "functions"		   },
-	{ true,  'c', "class",		  "classes"			   },
-	{ true,  'm', "method",		  "methods"			   },
-	{ true,  'p', "property",	  "properties"		   },
-	{ true,  'C', "constant",	  "constants"		   },
-	{ true,  'v', "variable",	  "global variables"   },
-	{ true,  'g', "generator",	  "generators"		   },
-	{ true,  'G', "getter",		  "getters"			   },
-	{ true,  'S', "setter",		  "setters"			   },
-	{ true,  'M', "field",		  "fields"			   },
+	{ true,  'f', "function",	  "functions"        },
+	{ true,  'c', "class",		  "classes",
+	  .referenceOnly = false, ATTACH_ROLES(JsClassRoles)    },
+	{ true,  'm', "method",		  "methods"          },
+	{ true,  'p', "property",	  "properties"       },
+	{ true,  'C', "constant",	  "constants"        },
+	{ true,  'v', "variable",	  "global variables",
+	  .referenceOnly = false, ATTACH_ROLES(JsVariableRoles) },
+	{ true,  'g', "generator",	  "generators"       },
+	{ true,  'G', "getter",		  "getters"          },
+	{ true,  'S', "setter",		  "setters"          },
+	{ true,  'M', "field",		  "fields"           },
 };
 
 static const keywordTable JsKeywordTable [] = {
@@ -226,17 +322,19 @@ static const keywordTable JsKeywordTable [] = {
 static void readTokenFull (tokenInfo *const token, bool include_newlines, vString *const repr);
 static void skipArgumentList (tokenInfo *const token, bool include_newlines, vString *const repr);
 static void parseFunction (tokenInfo *const token);
-static bool parseBlock (tokenInfo *const token, const vString *const parentScope);
-static bool parseMethods (tokenInfo *const token, const tokenInfo *const class, const bool is_es6_class);
+static bool parseBlock (tokenInfo *const token, int parentScope);
+static bool parseMethods (tokenInfo *const token, int classIndex, const bool is_es6_class);
 static bool parseLine (tokenInfo *const token, bool is_inside_class);
 static void parseUI5 (tokenInfo *const token);
 
 #ifdef DO_TRACING
 static const char *tokenTypeName(enum eTokenType e);
+static const char* getNameStringForCorkIndex(int index);
+static const char* getKindStringForCorkIndex(int index);
+static const char *kindName(jsKind kind);
 // #define DO_TRACING_USE_DUMP_TOKEN
 #ifdef DO_TRACING_USE_DUMP_TOKEN
 static void dumpToken (const tokenInfo *const token);
-static const char *keywordName(enum eKeywordId e);
 #endif
 #endif
 
@@ -245,7 +343,7 @@ static void *newPoolToken (void *createArg CTAGS_ATTR_UNUSED)
 	tokenInfo *token = xMalloc (1, tokenInfo);
 
 	token->string		= vStringNew ();
-	token->scope		= vStringNew ();
+	token->scope		= CORK_NIL;
 
 	return token;
 }
@@ -261,14 +359,13 @@ static void clearPoolToken (void *data)
 	token->lineNumber   = getInputLineNumber ();
 	token->filePosition = getInputFilePosition ();
 	vStringClear (token->string);
-	vStringClear (token->scope);
+	token->scope 		= CORK_NIL;
 }
 
 static void deletePoolToken (void *data)
 {
 	tokenInfo *token = data;
 	vStringDelete (token->string);
-	vStringDelete (token->scope);
 	eFree (token);
 }
 
@@ -284,7 +381,7 @@ static void copyToken (tokenInfo *const dest, const tokenInfo *const src,
 	if (include_non_read_info)
 	{
 		dest->nestLevel = src->nestLevel;
-		vStringCopy(dest->scope, src->scope);
+		dest->scope = src->scope;
 	}
 }
 
@@ -299,137 +396,218 @@ static void injectDynamicName (tokenInfo *const token, vString *newName)
  *	 Tag generation functions
  */
 
-static void makeJsTagCommon (const tokenInfo *const token, const jsKind kind,
-							 vString *const signature, vString *const inheritance,
-							 bool anonymous)
+struct  bestJSEntryInScopeData {
+	int index;
+};
+
+static bool findBestJSEntry (int corkIndex, tagEntryInfo *entry, void *cbData)
 {
-	if (JsKinds [kind].enabled )
+	struct  bestJSEntryInScopeData *data = cbData;
+
+	if (isRoleAssigned (entry, ROLE_DEFINITION_INDEX))
 	{
-		const char *name = vStringValue (token->string);
-		vString *fullscope = vStringNewCopy (token->scope);
-		const char *p;
+		data->index = corkIndex;
+		return false;
+	}
+
+	if (data->index == CORK_NIL || data->index > corkIndex)
+		data->index = corkIndex;
+	return true;
+}
+
+static int bestJSEntryInScope(int scope, const char *name)
+{
+	/* If the SCOPE has a tag entry having NAME, the tag is the best
+	 * even if there are reference tag entries having NAME.
+	 * If the scope has only reference tag entries having NAME, the
+	 * tag having smallest cork index is the best.
+	 */
+
+	struct  bestJSEntryInScopeData data = {
+		.index = CORK_NIL,
+	};
+	foreachEntriesInScope (scope, name,  findBestJSEntry, &data);
+	return data.index;
+}
+
+static int makeJsRefTagsForNameChain (char *name_chain, const tokenInfo *token, int leaf_kind, int scope)
+{
+	/* To fill the scope field of "d" of "a.b.c.d",
+	 * "c" must be tagged if the cork API is used.
+	 * ----------------------------------------------------------
+	 * How the fields for "a", "b", and "c" are filled.
+	 *   a  kind:class	scope:<given by SCOPE> roles:chainElt
+	 *   b  kind:class	scope:class:a	roles:chainElt
+	 *
+	 *   The fields of c depends on LEAF_KIND that is passed to this functions.
+	 *
+	 *   if (LEAF_KIND == FUNCTION)
+	 *       c  kind:function	scope:class:b	roles:chainElt
+	 *   else
+	 *       c  kind:class	scope:class:b	roles:chainElt
+	 */
+
+	const char *name = name_chain;
+	char *next = strchr(name_chain, '.');
+	if (next)
+		*next = '\0';
+	int index = bestJSEntryInScope (scope, name);
+
+	if (index == CORK_NIL)
+	{
 		tagEntryInfo e;
-
-		if (!token->dynamicProp && kind != JSTAG_PROPERTY &&  (p = strrchr (name, '.')) != NULL )
+		int kind = JSTAG_CLASS;
+		int role = JS_CLASS_CHAINELT;
+		if (next == NULL && leaf_kind == JSTAG_FUNCTION)
 		{
-			if (vStringLength (fullscope) > 0)
-				vStringPut (fullscope, '.');
-			vStringNCatS (fullscope, name, (size_t) (p - name));
-			name = p + 1;
-		}
-
-		initTagEntry (&e, name, kind);
-
-		TRACE_PRINT("Emitting tag for symbol '%s' of kind %02x with scope '%s'",name,kind,vStringValue(fullscope));
-
-		e.lineNumber   = token->lineNumber;
-		e.filePosition = token->filePosition;
-
-		if ( vStringLength(fullscope) > 0 )
-		{
-			/* FIXME: proper parent type */
-			jsKind parent_kind = JSTAG_CLASS;
-
 			/*
 			 * If we're creating a function (and not a method),
-			 * guess we're inside another function
+			 * assume the parent is a plain variable.
 			 */
-			if (kind == JSTAG_FUNCTION)
-				parent_kind = JSTAG_FUNCTION;
-
-			e.extensionFields.scopeKindIndex = parent_kind;
-			e.extensionFields.scopeName = vStringValue (fullscope);
+			kind = JSTAG_VARIABLE;
+			role = JS_VARIABLE_CHAINELT;
 		}
 
-		if (signature && vStringLength(signature))
-		{
-			size_t i;
-			/* sanitize signature by replacing all control characters with a
-			 * space (because it's simple).
-			 * there should never be any junk in a valid signature, but who
-			 * knows what the user wrote and CTags doesn't cope well with weird
-			 * characters. */
-			for (i = 0; i < signature->length; i++)
-			{
-				unsigned char c = (unsigned char) vStringChar (signature, i);
-				if (c < 0x20 /* below space */ || c == 0x7F /* DEL */)
-					vStringChar (signature, i) = ' ';
-			}
-			e.extensionFields.signature = vStringValue(signature);
-		}
+		initRefTagEntry (&e, name, kind, role);
+		e.lineNumber = token->lineNumber;
+		e.filePosition = token->filePosition;
+		e.extensionFields.scopeIndex = scope;
 
-		if (inheritance)
-			e.extensionFields.inheritance = vStringValue(inheritance);
-
-		if (anonymous)
-			markTagExtraBit (&e, XTAG_ANONYMOUS);
-
-		makeTagEntry (&e);
-		vStringDelete (fullscope);
+		index = makeTagEntry (&e);
+		/* We shold remove This condition. We should fix the callers passing
+		 * an empty name instead. makeTagEntry() returns CORK_NIL if the tag
+		 * name is empty. */
+		if (index != CORK_NIL)
+			registerEntry (index);
 	}
+
+	return next
+		? makeJsRefTagsForNameChain (next + 1, token, leaf_kind, index)
+		: index;
 }
 
-static void makeJsTag (const tokenInfo *const token, const jsKind kind,
+static int makeJsTagCommon (const tokenInfo *const token, const jsKind kind,
+							vString *const signature, vString *const inheritance,
+							bool anonymous)
+{
+	int index = CORK_NIL;
+	const char *name = vStringValue (token->string);
+
+	const char *p;
+	char *name_chain = NULL;
+	if (!token->dynamicProp && kind != JSTAG_PROPERTY &&  (p = strrchr (name, '.')) != NULL )
+	{
+		if ((p - name) != 0)
+			name_chain = eStrndup (name, (size_t) (p - name));
+		name = p + 1;
+		if (name[0] == '\0')
+			return CORK_NIL;
+	}
+
+	int scope = token->scope;
+	if (name_chain)
+	{
+		scope = makeJsRefTagsForNameChain (name_chain, token, kind, scope);
+		eFree (name_chain);
+	}
+
+	/*
+	 * Check whether NAME is already defined in SCOPE.
+	 * If the NAME is already defined, return the cork index for the NAME.
+	 */
+	if (kind == JSTAG_FUNCTION || kind == JSTAG_CLASS)
+	{
+		index = anyKindEntryInScope (scope, name, kind, true);
+		if (index != CORK_NIL)
+			return index;
+	}
+
+	tagEntryInfo e;
+	initTagEntry (&e, name, kind);
+	e.lineNumber   = token->lineNumber;
+	e.filePosition = token->filePosition;
+	e.extensionFields.scopeIndex = scope;
+
+#ifdef DO_TRACING
+	{
+		const char *scopeStr = getNameStringForCorkIndex (scope);
+		const char *scopeKindStr = getKindStringForCorkIndex (scope);
+		TRACE_PRINT("Emitting tag for symbol '%s' of kind %s with scope '%s:%s'", name, kindName(kind), scopeKindStr, scopeStr);
+	}
+#endif
+
+	if (signature && vStringLength(signature))
+	{
+		size_t i;
+		/* sanitize signature by replacing all control characters with a
+		 * space (because it's simple).
+		 * there should never be any junk in a valid signature, but who
+		 * knows what the user wrote and CTags doesn't cope well with weird
+		 * characters. */
+		for (i = 0; i < signature->length; i++)
+		{
+			unsigned char c = (unsigned char) vStringChar (signature, i);
+			if (c < 0x20 /* below space */ || c == 0x7F /* DEL */)
+				vStringChar (signature, i) = ' ';
+		}
+		e.extensionFields.signature = vStringValue(signature);
+	}
+
+	if (inheritance)
+		e.extensionFields.inheritance = vStringValue(inheritance);
+
+	if (anonymous)
+		markTagExtraBit (&e, XTAG_ANONYMOUS);
+
+	index = makeTagEntry (&e);
+	/* We shold remove This condition. We should fix the callers passing
+	 * an empty name instead. makeTagEntry() returns CORK_NIL if the tag
+	 * name is empty. */
+	if (index != CORK_NIL)
+		registerEntry (index);
+
+	return index;
+}
+
+static int makeJsTag (const tokenInfo *const token, const jsKind kind,
 					   vString *const signature, vString *const inheritance)
 {
-	makeJsTagCommon (token, kind, signature, inheritance, false);
+	return makeJsTagCommon (token, kind, signature, inheritance, false);
 }
 
-static void makeClassTagCommon (tokenInfo *const token, vString *const signature,
+static int makeClassTagCommon (tokenInfo *const token, vString *const signature,
                           vString *const inheritance, bool anonymous)
 {
-	vString *	fulltag = vStringNew ();
-	if (vStringLength (token->scope) > 0)
-	{
-		vStringCopy(fulltag, token->scope);
-		vStringPut (fulltag, '.');
-		vStringCat (fulltag, token->string);
-	}
-	else
-	{
-		vStringCopy(fulltag, token->string);
-	}
-	if ( ! stringListHas(ClassNames, vStringValue (fulltag)) )
-	{
-		stringListAdd (ClassNames, vStringNewCopy (fulltag));
-		makeJsTagCommon (token, JSTAG_CLASS, signature, inheritance,
-						 anonymous);
-	}
-	vStringDelete (fulltag);
+	return makeJsTagCommon (token, JSTAG_CLASS, signature, inheritance, anonymous);
 }
 
-static void makeClassTag (tokenInfo *const token, vString *const signature,
+static int makeClassTag (tokenInfo *const token, vString *const signature,
 						  vString *const inheritance)
 {
-	makeClassTagCommon (token, signature, inheritance, false);
+	return makeClassTagCommon (token, signature, inheritance, false);
 }
 
-static void makeFunctionTagCommon (tokenInfo *const token, vString *const signature, bool generator,
+static int makeFunctionTagCommon (tokenInfo *const token, vString *const signature, bool generator,
 								   bool anonymous)
 {
-	vString *	fulltag = vStringNew ();
-	if (vStringLength (token->scope) > 0)
-	{
-		vStringCopy(fulltag, token->scope);
-		vStringPut (fulltag, '.');
-		vStringCat (fulltag, token->string);
-	}
-	else
-	{
-		vStringCopy(fulltag, token->string);
-	}
-	if ( ! stringListHas(FunctionNames, vStringValue (fulltag)) )
-	{
-		stringListAdd (FunctionNames, vStringNewCopy (fulltag));
-		makeJsTagCommon (token, generator ? JSTAG_GENERATOR : JSTAG_FUNCTION, signature, NULL,
-						 anonymous);
-	}
-	vStringDelete (fulltag);
+	return makeJsTagCommon (token, generator ? JSTAG_GENERATOR : JSTAG_FUNCTION, signature, NULL,
+							anonymous);
 }
 
-static void makeFunctionTag (tokenInfo *const token, vString *const signature, bool generator)
+static int makeFunctionTag (tokenInfo *const token, vString *const signature, bool generator)
 {
-	makeFunctionTagCommon (token, signature, generator, false);
+	return makeFunctionTagCommon (token, signature, generator, false);
+}
+
+static bool isClassName (tokenInfo *const name)
+{
+	char * p = strrchr(vStringValue (name->string), '.');
+	if (p == NULL)
+		p = vStringValue (name->string);
+	else
+		p++;
+
+	return isupper((unsigned char) *p);
 }
 
 /*
@@ -852,7 +1030,36 @@ getNextChar:
 		case ')': token->type = TOKEN_CLOSE_PAREN;			break;
 		case ';': token->type = TOKEN_SEMICOLON;			break;
 		case ',': token->type = TOKEN_COMMA;				break;
-		case '.': token->type = TOKEN_PERIOD;				break;
+		case '.':
+			{
+				token->type = TOKEN_PERIOD;
+
+				int d = getcFromInputFile ();
+				if (d != '.')
+				{
+					ungetcToInputFile (d);
+					break;
+				}
+
+				d = getcFromInputFile ();
+				if (d != '.')
+				{
+					ungetcToInputFile (d);
+					ungetcToInputFile ('.');
+					break;
+				}
+
+				token->type = TOKEN_DOTS;
+				if (repr)
+				{
+					/* Adding two dots is enough here.
+					 * The first one is already added with
+					 * vStringPut (repr, c).
+					 */
+					vStringCatS (repr, "..");
+				}
+				break;
+			}
 		case ':': token->type = TOKEN_COLON;				break;
 		case '{': token->type = TOKEN_OPEN_CURLY;			break;
 		case '}': token->type = TOKEN_CLOSE_CURLY;			break;
@@ -1128,12 +1335,12 @@ static void readTokenFull (tokenInfo *const token, bool include_newlines, vStrin
 	}
 }
 
-#ifdef JSCRIPT_DO_DEBUGGING
+#ifdef DO_TRACING_USE_DUMP_TOKEN
 /* trace readTokenFull() */
 static void readTokenFullDebug (tokenInfo *const token, bool include_newlines, vString *const repr)
 {
 	readTokenFull (token, include_newlines, repr);
-	TRACE_PRINT("token '%s' of type %02x with scope '%s'",vStringValue(token->string),token->type, vStringValue(token->scope));
+	dumpToken (token);
 }
 # define readTokenFull readTokenFullDebug
 #endif
@@ -1147,19 +1354,30 @@ static void readToken (tokenInfo *const token)
  *	 Token parsing functions
  */
 
-static void parseMethodsInAnonymousClass (tokenInfo *const token)
+static int parseMethodsInAnonymousObject (tokenInfo *const token)
 {
-	tokenInfo *const anon_class = newToken ();
-	copyToken (anon_class, token, true);
-	anonGenerate (anon_class->string, "AnonymousClass", JSTAG_CLASS);
-	anon_class->type = TOKEN_IDENTIFIER;
+	int index = CORK_NIL;
 
-	bool has_methods = parseMethods (token, anon_class, false);
+	tokenInfo *const anon_object = newToken ();
+	copyToken (anon_object, token, true);
+	anonGenerate (anon_object->string, "anonymousObject", JSTAG_VARIABLE);
+	anon_object->type = TOKEN_IDENTIFIER;
 
-	if (has_methods)
-		makeJsTagCommon (anon_class, JSTAG_CLASS, NULL, NULL, true);
+	index = makeJsTagCommon (anon_object, JSTAG_VARIABLE, NULL, NULL, true);
+	if (! parseMethods (token, index, false))
+	{
+		/* If no method is found, the anonymous object
+		 * should not be tagged.
+		 */
+		tagEntryInfo *e = getEntryInCorkQueue (index);
+		if (e)
+			markTagPlaceholder (e, true);
+		index = CORK_NIL;
+	}
 
-	deleteToken (anon_class);
+	deleteToken (anon_object);
+
+	return index;
 }
 
 static void skipArgumentList (tokenInfo *const token, bool include_newlines, vString *const repr)
@@ -1181,9 +1399,9 @@ static void skipArgumentList (tokenInfo *const token, bool include_newlines, vSt
 			else if (isType (token, TOKEN_OPEN_CURLY))
 			{
 				if (prev_token_type == TOKEN_ARROW)
-					parseBlock (token, NULL);
+					parseBlock (token, CORK_NIL);
 				else
-					parseMethodsInAnonymousClass (token);
+					parseMethodsInAnonymousObject (token);
 			}
 			else if (isKeyword (token, KEYWORD_function))
 				parseFunction (token);
@@ -1216,9 +1434,9 @@ static void skipArrayList (tokenInfo *const token, bool include_newlines)
 			else if (isType (token, TOKEN_OPEN_CURLY))
 			{
 				if (prev_token_type == TOKEN_ARROW)
-					parseBlock (token, NULL);
+					parseBlock (token, CORK_NIL);
 				else
-					parseMethodsInAnonymousClass (token);
+					parseMethodsInAnonymousObject (token);
 			}
 
 			prev_token_type = token->type;
@@ -1249,15 +1467,6 @@ static void addContext (tokenInfo* const parent, const tokenInfo* const child)
 	vStringCat (parent->string, child->string);
 }
 
-static void addToScope (tokenInfo* const token, const vString* const extra)
-{
-	if (vStringLength (token->scope) > 0)
-	{
-		vStringPut (token->scope, '.');
-	}
-	vStringCat (token->scope, extra);
-}
-
 /*
  *	 Scanning functions
  */
@@ -1277,21 +1486,15 @@ static bool findCmdTerm (tokenInfo *const token, bool include_newlines,
 		/* Handle nested blocks */
 		if ( isType (token, TOKEN_OPEN_CURLY))
 		{
-			parseBlock (token, NULL);
+			parseBlock (token, CORK_NIL);
 			readTokenFull (token, include_newlines, NULL);
 		}
 		else if ( isType (token, TOKEN_OPEN_PAREN) )
-		{
 			skipArgumentList(token, include_newlines, NULL);
-		}
 		else if ( isType (token, TOKEN_OPEN_SQUARE) )
-		{
 			skipArrayList(token, include_newlines);
-		}
 		else
-		{
 			readTokenFull (token, include_newlines, NULL);
-		}
 	}
 
 	return isType (token, TOKEN_SEMICOLON);
@@ -1320,7 +1523,7 @@ static void parseSwitch (tokenInfo *const token)
 
 	if (isType (token, TOKEN_OPEN_CURLY))
 	{
-		parseBlock (token, NULL);
+		parseBlock (token, CORK_NIL);
 	}
 }
 
@@ -1354,31 +1557,21 @@ static bool parseLoop (tokenInfo *const token)
 		readToken(token);
 
 		if (isType (token, TOKEN_OPEN_PAREN))
-		{
 			skipArgumentList(token, false, NULL);
-		}
 
 		if (isType (token, TOKEN_OPEN_CURLY))
-		{
-			parseBlock (token, NULL);
-		}
+			parseBlock (token, CORK_NIL);
 		else
-		{
 			is_terminated = parseLine(token, false);
-		}
 	}
 	else if (isKeyword (token, KEYWORD_do))
 	{
 		readToken(token);
 
 		if (isType (token, TOKEN_OPEN_CURLY))
-		{
-			parseBlock (token, NULL);
-		}
+			parseBlock (token, CORK_NIL);
 		else
-		{
 			is_terminated = parseLine(token, false);
-		}
 
 		if (is_terminated)
 			readToken(token);
@@ -1388,9 +1581,8 @@ static bool parseLoop (tokenInfo *const token)
 			readToken(token);
 
 			if (isType (token, TOKEN_OPEN_PAREN))
-			{
 				skipArgumentList(token, true, NULL);
-			}
+
 			if (! isType (token, TOKEN_SEMICOLON))
 			{
 				/* oddly enough, `do {} while (0) var foo = 42` is perfectly
@@ -1459,14 +1651,10 @@ static bool parseIf (tokenInfo *const token)
 	}
 
 	if (isType (token, TOKEN_OPEN_PAREN))
-	{
 		skipArgumentList(token, false, NULL);
-	}
 
 	if (isType (token, TOKEN_OPEN_CURLY))
-	{
-		parseBlock (token, NULL);
-	}
+		parseBlock (token, CORK_NIL);
 	else
 	{
 		/* The next token should only be read if this statement had its own
@@ -1476,13 +1664,82 @@ static bool parseIf (tokenInfo *const token)
 	return read_next_token;
 }
 
+static bool collectChildren (int corkIndex, tagEntryInfo *entry, void *data)
+{
+	intArray *children = (intArray *)data;
+
+	Assert (entry->extensionFields.scopeIndex != CORK_NIL);
+	intArrayAdd (children, corkIndex);
+
+	return true;
+}
+
+/* During parsing, there is a case that a language object (parent)
+ * should be tagged only when there are language objects (children)
+ * are defined in the parent; if the parent has no child, the parser
+ * should not make a tag for the parent.
+ *
+ * Handling the this case was not easy because the parser must fill
+ * the scope field of children with the cork index of parent.
+ * However, the parser can decide whether the parent should be tagged
+ * or not after parsing inside the parent where the children are
+ * defined.
+ *
+ * "class" is an example of the language object of the parent.
+ * "methods" are examples of the language object of the children.
+ * "class" is tagged as a class only when methods are found in it.
+ *
+ *
+ * The parser handles this case with the following steps:
+ *
+ * 1.  make a dummy tag entry for the candidate of parent with
+ *
+ * >       int dummyIndex = makeSimplePlaceholder().
+ *
+ *     ctags doesn't emit this dummy tag entry.
+ *
+ * 2.  parse inside the candidate of parent and count children.
+ *     If a child is found, make a tag for it with filling its
+ *     scope field with the dummyIndex.
+ *
+ * 3. make a true tag entry for the parent if a child is found:
+ *
+ * >       int trueIdex = makeTagEntry (...);
+ *
+ * 4. update the scope fields of children with the trueIdex.
+ *
+ *         moveChildren (dummyIndex, trueIdex);
+ *
+ */
+static void moveChildren (int oldParent, int newParent)
+{
+	intArray *children = intArrayNew ();
+	foreachEntriesInScope (oldParent, NULL, collectChildren, children);
+	for (unsigned int i = 0; i < intArrayCount (children); i++)
+	{
+		int c = intArrayItem (children, i);
+
+		unregisterEntry (c);
+		tagEntryInfo *e = getEntryInCorkQueue (c);
+		Assert (e);
+		e->extensionFields.scopeIndex = newParent;
+		registerEntry (c);
+	}
+	intArrayDelete (children);
+}
+
 static void parseFunction (tokenInfo *const token)
 {
-	TRACE_ENTER();
+#ifdef DO_TRACING
+	{
+		const char *scopeStr = getNameStringForCorkIndex (token->scope);
+		const char *scopeKindStr = getKindStringForCorkIndex (token->scope);
+		TRACE_ENTER_TEXT("token has scope '%s' of kind %s", scopeStr, scopeKindStr);
+	}
+#endif
 
 	tokenInfo *const name = newToken ();
 	vString *const signature = vStringNew ();
-	bool is_class = false;
 	bool is_generator = false;
 	bool is_anonymous = false;
 	/*
@@ -1502,7 +1759,7 @@ static void parseFunction (tokenInfo *const token)
 	{
 		/* anonymous function */
 		copyToken (token, name, false);
-		anonGenerate (name->string, "AnonymousFunction", JSTAG_FUNCTION);
+		anonGenerate (name->string, "anonymousFunction", JSTAG_FUNCTION);
 		is_anonymous = true;
 	}
 	else if (!isType (name, TOKEN_IDENTIFIER))
@@ -1525,11 +1782,11 @@ static void parseFunction (tokenInfo *const token)
 
 	if ( isType (token, TOKEN_OPEN_CURLY) )
 	{
-		is_class = parseBlock (token, name->string);
-		if ( is_class )
-			makeClassTagCommon (name, signature, NULL, is_anonymous);
-		else
+		const int p = isClassName (name) ?
+			makeClassTagCommon (name, signature, NULL, is_anonymous) :
 			makeFunctionTagCommon (name, signature, is_generator, is_anonymous);
+
+		parseBlock (token, p);
 	}
 
 	findCmdTerm (token, false, false);
@@ -1543,18 +1800,17 @@ static void parseFunction (tokenInfo *const token)
 
 /* Parses a block surrounded by curly braces.
  * @p parentScope is the scope name for this block, or NULL for unnamed scopes */
-static bool parseBlock (tokenInfo *const token, const vString *const parentScope)
+static bool parseBlock (tokenInfo *const token, int parentScope)
 {
 	TRACE_ENTER();
 
 	bool is_class = false;
 	bool read_next_token = true;
-	vString * saveScope = vStringNew ();
+	int saveScope = token->scope;
 
-	vStringCopy(saveScope, token->scope);
-	if (parentScope)
+	if (parentScope != CORK_NIL)
 	{
-		addToScope (token, parentScope);
+		token->scope = parentScope;
 		token->nestLevel++;
 	}
 
@@ -1601,7 +1857,7 @@ static bool parseBlock (tokenInfo *const token, const vString *const parentScope
 			else if (isType (token, TOKEN_OPEN_CURLY))
 			{
 				/* Handle nested blocks */
-				parseBlock (token, NULL);
+				parseBlock (token, CORK_NIL);
 			}
 			else
 			{
@@ -1629,9 +1885,8 @@ static bool parseBlock (tokenInfo *const token, const vString *const parentScope
 				 ! isType (token, TOKEN_CLOSE_CURLY) && read_next_token);
 	}
 
-	vStringCopy(token->scope, saveScope);
-	vStringDelete(saveScope);
-	if (parentScope)
+	token->scope = saveScope;
+	if (parentScope != CORK_NIL)
 		token->nestLevel--;
 
 	TRACE_LEAVE();
@@ -1639,22 +1894,28 @@ static bool parseBlock (tokenInfo *const token, const vString *const parentScope
 	return is_class;
 }
 
-static bool parseMethods (tokenInfo *const token, const tokenInfo *const class,
+static bool parseMethods (tokenInfo *const token, int classIndex,
                           const bool is_es6_class)
 {
-	TRACE_ENTER_TEXT("token is '%s' of type %s in classToken '%s' of type %s (es6: %s)",
+	TRACE_ENTER_TEXT("token is '%s' of type %s in parentToken '%s' of kind %s (es6: %s)",
 					 vStringValue(token->string), tokenTypeName (token->type),
-					 class == NULL ? "none" : vStringValue(class->string),
-					 class == NULL ? "none" : tokenTypeName (class->type),
+					 classIndex == CORK_NIL ? "none" : getNameStringForCorkIndex (classIndex),
+					 classIndex == CORK_NIL ? "none" : getKindStringForCorkIndex (classIndex),
 					 is_es6_class? "yes": "no");
 
+	/*
+	 * When making a tag for `name', its core index is stored to
+	 * `indexForName'. The value stored to `indexForName' is valid
+	 * till the value for `name' is updated. If the value for `name'
+	 * is changed, `indexForName' is reset to CORK_NIL.
+	 */
 	tokenInfo *const name = newToken ();
+	int indexForName = CORK_NIL;
 	bool has_methods = false;
-	vString *saveScope = vStringNew ();
+	int saveScope = token->scope;
 
-	vStringCopy (saveScope, token->scope);
-	if (class != NULL)
-		addToScope (token, class->string);
+	if (classIndex != CORK_NIL)
+		token->scope = classIndex;
 
 	/*
 	 * This deals with these formats
@@ -1707,7 +1968,7 @@ static bool parseMethods (tokenInfo *const token, const tokenInfo *const class,
 			tokenInfo *saved_token = newToken ();
 			copyToken (saved_token, token, true);
 			readToken (token);
-			if (isType(token, TOKEN_OPEN_PAREN))
+			if (isType(token, TOKEN_OPEN_PAREN) || isType(token, TOKEN_COLON))
 			{
 				Assert (NextToken == NULL);
 				NextToken = newToken ();
@@ -1717,13 +1978,10 @@ static bool parseMethods (tokenInfo *const token, const tokenInfo *const class,
 				token->keyword = KEYWORD_NONE;
 			}
 			else if (isKeyword (saved_token, KEYWORD_get))
-			{
 				is_getter = true;
-			}
 			else
-			{
 				is_setter = true;
-			}
+
 			deleteToken (saved_token);
 		}
 
@@ -1753,6 +2011,7 @@ static bool parseMethods (tokenInfo *const token, const tokenInfo *const class,
 			}
 
 			copyToken(name, token, true);
+			indexForName = CORK_NIL;
 			if (is_computed_name && ! isType (token, TOKEN_STRING))
 				is_dynamic_prop = true;
 
@@ -1778,6 +2037,7 @@ static bool parseMethods (tokenInfo *const token, const tokenInfo *const class,
 			if (is_dynamic_prop)
 			{
 				injectDynamicName (name, dprop);
+				indexForName = CORK_NIL;
 				dprop = NULL;
 			}
 			else
@@ -1827,8 +2087,8 @@ function:
 						else if (is_setter)
 							kind = JSTAG_SETTER;
 
-						makeJsTag (name, kind, signature, NULL);
-						parseBlock (token, name->string);
+						indexForName = makeJsTag (name, kind, signature, NULL);
+						parseBlock (token, indexForName);
 
 						/*
 						 * If we aren't parsing an ES6 class (for which there
@@ -1842,7 +2102,7 @@ function:
 				}
 				else if (! is_es6_class)
 				{
-					bool has_child_methods = false;
+					int p = CORK_NIL;
 					tokenInfo *saved_token = newToken ();
 
 					/* skip whatever is the value */
@@ -1853,7 +2113,8 @@ function:
 						if (isType (token, TOKEN_OPEN_CURLY))
 						{
 							/* Recurse to find child properties/methods */
-							has_child_methods = parseMethods (token, name, false);
+							p = makeSimplePlaceholder (name->string);
+							parseMethods (token, p, false);
 							readToken (token);
 						}
 						else if (isType (token, TOKEN_OPEN_PAREN))
@@ -1888,10 +2149,9 @@ function:
 					deleteToken (saved_token);
 
 					has_methods = true;
-					if (has_child_methods)
-						makeJsTag (name, JSTAG_CLASS, NULL, NULL);
-					else
-						makeJsTag (name, JSTAG_PROPERTY, NULL, NULL);
+					indexForName = makeJsTag (name, JSTAG_PROPERTY, NULL, NULL);
+					if (p != CORK_NIL)
+						moveChildren (p, indexForName);
 				}
 				else if (can_be_field)
 				{
@@ -1916,8 +2176,7 @@ function:
 	findCmdTerm (token, false, false);
 
 cleanUp:
-	vStringCopy (token->scope, saveScope);
-	vStringDelete (saveScope);
+	token->scope = saveScope;
 	deleteToken (name);
 
 	TRACE_LEAVE_TEXT("found method(s): %s", has_methods? "yes": "no");
@@ -1973,8 +2232,8 @@ static bool parseES6Class (tokenInfo *const token, const tokenInfo *targetName)
 
 	TRACE_PRINT("Emitting tag for class '%s'", vStringValue(targetName->string));
 
-	makeJsTagCommon (targetName, JSTAG_CLASS, NULL, inheritance,
-					 (is_anonymous && (targetName == className)));
+	int r = makeJsTagCommon (targetName, JSTAG_CLASS, NULL, inheritance,
+							 (is_anonymous && (targetName == className)));
 
 	if (! is_anonymous && targetName != className)
 	{
@@ -1991,7 +2250,7 @@ static bool parseES6Class (tokenInfo *const token, const tokenInfo *targetName)
 		vStringDelete (inheritance);
 
 	if (isType (token, TOKEN_OPEN_CURLY))
-		parseMethods (token, targetName, true);
+		parseMethods (token, r, true);
 
 	deleteToken (className);
 
@@ -1999,23 +2258,65 @@ static bool parseES6Class (tokenInfo *const token, const tokenInfo *targetName)
 	return true;
 }
 
+static void convertToFunction (int index, const char *signature)
+{
+	tagEntryInfo *e = getEntryInCorkQueue(index);
+	if (e && e->kindIndex != JSTAG_FUNCTION
+		&& ( signature == NULL || e->extensionFields.signature == NULL))
+	{
+		e->kindIndex = JSTAG_FUNCTION;
+		if (signature)
+			e->extensionFields.signature = eStrdup (signature);
+	}
+}
+
+static vString *trimGarbageInSignature (vString *sig)
+{
+	/* Drop "=>" at the end. */
+	const char *sigstr = vStringValue (sig);
+	char *last = strrchr (sigstr, ')');
+	Assert (last);
+	vStringTruncate (sig, last - sigstr + 1);
+	return sig;
+}
+
+static vString *makeVStringForSignature (tokenInfo *const token)
+{
+	vString * sig = vStringNewInit ("(");
+
+	if (isType (token, TOKEN_IDENTIFIER))
+		vStringCat (sig, token->string);
+	else if (isType (token, TOKEN_CLOSE_PAREN))
+		vStringPut (sig, ')');
+	else if (isType (token, TOKEN_DOTS))
+		vStringCatS (sig, "...");
+
+	return sig;
+}
+
 static bool parseStatement (tokenInfo *const token, bool is_inside_class)
 {
 	TRACE_ENTER_TEXT("is_inside_class: %s", is_inside_class? "yes": "no");
 
+	/*
+	 * When making a tag for `name', its core index is stored to
+	 * `indexForName'. The value stored to `indexForName' is valid
+	 * till the value for `name' is updated. If the value for `name'
+	 * is changed, `indexForName' is reset to CORK_NIL.
+	 */
 	tokenInfo *const name = newToken ();
+	int indexForName = CORK_NIL;
 	tokenInfo *const secondary_name = newToken ();
 	tokenInfo *const method_body_token = newToken ();
-	vString * saveScope = vStringNew ();
+	int saveScope = token->scope;
 	bool is_class = false;
 	bool is_var = false;
 	bool is_const = false;
 	bool is_terminated = true;
 	bool is_global = false;
 	bool has_methods = false;
-	vString *	fulltag;
+	bool found_this = false;
 
-	vStringCopy (saveScope, token->scope);
 	/*
 	 * Functions can be named or unnamed.
 	 * This deals with these formats:
@@ -2066,9 +2367,11 @@ static bool parseStatement (tokenInfo *const token, bool is_inside_class)
 	}
 
 nextVar:
+	found_this = false;
 	if ( isKeyword(token, KEYWORD_this) )
 	{
 		TRACE_PRINT("found 'this' keyword");
+		found_this = true;
 
 		readToken(token);
 		if (isType (token, TOKEN_PERIOD))
@@ -2078,6 +2381,7 @@ nextVar:
 	}
 
 	copyToken(name, token, true);
+	indexForName = CORK_NIL;
 	TRACE_PRINT("name becomes '%s' of type %s",
 				vStringValue(token->string), tokenTypeName (token->type));
 
@@ -2088,7 +2392,9 @@ nextVar:
 	       ! isType (token, TOKEN_EOF))
 	{
 		if (isType (token, TOKEN_OPEN_CURLY))
-			parseBlock (token, NULL);
+			parseBlock (token, CORK_NIL);
+		else if (isKeyword (token, KEYWORD_function))
+			parseFunction (token);
 
 		/* Potentially the name of the function */
 		if (isType (token, TOKEN_PERIOD))
@@ -2100,19 +2406,20 @@ nextVar:
 			/* Assume it's an assignment to a global name (e.g. a class) using
 			 * its fully qualified name, so strip the scope.
 			 * FIXME: resolve the scope so we can make more than an assumption. */
-			vStringClear (token->scope);
-			vStringClear (name->scope);
+			token->scope = CORK_NIL;
+			name->scope = CORK_NIL;
 			do
 			{
 				readToken (token);
 				if (! isType(token, TOKEN_KEYWORD))
 				{
 					if ( is_class )
-					{
-						addToScope(token, name->string);
-					}
+						token->scope = indexForName;
 					else
+					{
 						addContext (name, token);
+						indexForName = CORK_NIL;
+					}
 
 					readToken (token);
 				}
@@ -2151,7 +2458,7 @@ nextVar:
 						 */
 						goto cleanUp;
 
-					makeClassTag (name, NULL, NULL);
+					indexForName = makeClassTag (name, NULL, NULL);
 					is_class = true;
 
 					/*
@@ -2168,7 +2475,7 @@ nextVar:
 						{
 							vString *const signature = vStringNew ();
 
-							addToScope(token, name->string);
+							token->scope = indexForName;
 
 							copyToken (method_body_token, token, true);
 							readToken (method_body_token);
@@ -2185,12 +2492,12 @@ nextVar:
 									readToken (method_body_token);
 							}
 
-							makeJsTag (token, JSTAG_METHOD, signature, NULL);
+							int index = makeJsTag (token, JSTAG_METHOD, signature, NULL);
 							vStringDelete (signature);
 
 							if ( isType (method_body_token, TOKEN_OPEN_CURLY))
 							{
-								parseBlock (method_body_token, token->string);
+								parseBlock (method_body_token, index);
 								is_terminated = true;
 							}
 							else
@@ -2212,7 +2519,7 @@ nextVar:
 							 *         'validMethodTwo' : function(a,b) {}
 							 *     }
 							 */
-							parseMethods(token, name, false);
+							parseMethods(token, indexForName, false);
 							/*
 							 * Find to the end of the statement
 							 */
@@ -2267,7 +2574,7 @@ nextVar:
 			 * Handles this syntax:
 			 *	   var g_var2;
 			 */
-			makeJsTag (name, is_const ? JSTAG_CONSTANT : JSTAG_VARIABLE, NULL, NULL);
+			indexForName = makeJsTag (name, is_const ? JSTAG_CONSTANT : JSTAG_VARIABLE, NULL, NULL);
 		}
 		/*
 		 * Statement has ended.
@@ -2285,6 +2592,8 @@ nextVar:
 	if ( isType (token, TOKEN_EQUAL_SIGN) )
 	{
 		int parenDepth = 0;
+		int arrowfun_paren_depth = 0;
+		bool canbe_arrowfun = false;
 
 		readToken (token);
 
@@ -2292,11 +2601,23 @@ nextVar:
 		while (isType (token, TOKEN_OPEN_PAREN))
 		{
 			parenDepth++;
+			arrowfun_paren_depth++;
 			readToken (token);
 		}
 
 		if (isKeyword (token, KEYWORD_async))
+		{
+			arrowfun_paren_depth = 0;
 			readToken (token);
+
+			/* check for function signature */
+			while (isType (token, TOKEN_OPEN_PAREN))
+			{
+				parenDepth++;
+				arrowfun_paren_depth++;
+				readToken (token);
+			}
+		}
 
 		if ( isKeyword (token, KEYWORD_function) )
 		{
@@ -2339,15 +2660,10 @@ nextVar:
 
 			if (isType (token, TOKEN_OPEN_CURLY))
 			{
-				/*
-				 * This will be either a function or a class.
-				 * We can only determine this by checking the body
-				 * of the function.  If we find a "this." we know
-				 * it is a class, otherwise it is a function.
-				 */
+				// This will be either a function or a class.
 				if ( is_inside_class )
 				{
-					makeJsTag (name, is_generator ? JSTAG_GENERATOR : JSTAG_METHOD, signature, NULL);
+					indexForName = makeJsTag (name, is_generator ? JSTAG_GENERATOR : JSTAG_METHOD, signature, NULL);
 					if ( vStringLength(secondary_name->string) > 0 )
 						makeFunctionTag (secondary_name, signature, is_generator);
 				}
@@ -2363,16 +2679,16 @@ nextVar:
 						goto cleanUp;
 					}
 
-					is_class = parseBlock (token, name->string);
-					if ( is_class )
-						makeClassTag (name, signature, NULL);
-					else
+					indexForName = isClassName (name) ?
+						makeClassTag (name, signature, NULL):
 						makeFunctionTag (name, signature, is_generator);
+
+					parseBlock (token, indexForName);
 
 					if ( vStringLength(secondary_name->string) > 0 )
 						makeFunctionTag (secondary_name, signature, is_generator);
 				}
-				parseBlock (token, name->string);
+				parseBlock (token, indexForName);
 			}
 
 			vStringDelete (signature);
@@ -2385,120 +2701,32 @@ nextVar:
 		{
 			/*
 			 * Creates tags for each of these class methods
-			 *     ValidClassOne.prototype = {
+			 *     objectOne = {
 			 *         'validMethodOne' : function(a,b) {},
 			 *         'validMethodTwo' : function(a,b) {}
 			 *     }
 			 * Or checks if this is a hash variable.
 			 *     var z = {};
 			 */
-			bool anonClass = vStringIsEmpty (name->string);
-			if (anonClass)
-				anonGenerate (name->string, "AnonymousClass", JSTAG_CLASS);
-			has_methods = parseMethods(token, name, false);
+			bool anonObject = vStringIsEmpty (name->string);
+			if (anonObject)
+			{
+				anonGenerate (name->string, "anonymousObject", JSTAG_VARIABLE);
+				indexForName = CORK_NIL;
+			}
+			int p = makeSimplePlaceholder (name->string);
+			has_methods = parseMethods(token, p, false);
 			if (has_methods)
-				makeJsTagCommon (name, JSTAG_CLASS, NULL, NULL, anonClass);
-			else
+			{
+				jsKind kind = found_this || strchr (vStringValue(name->string), '.') != NULL ? JSTAG_PROPERTY : JSTAG_VARIABLE;
+				indexForName = makeJsTagCommon (name, kind, NULL, NULL, anonObject);
+				moveChildren (p, indexForName);
+			}
+			else if ( token->nestLevel == 0 && is_global )
 			{
 				/*
 				 * Only create variables for global scope
-				 */
-				if ( token->nestLevel == 0 && is_global )
-				{
-					/*
-					 * A pointer can be created to the function.
-					 * If we recognize the function/class name ignore the variable.
-					 * This format looks identical to a variable definition.
-					 * A variable defined outside of a block is considered
-					 * a global variable:
-					 *	   var g_var1 = 1;
-					 *	   var g_var2;
-					 * This is not a global variable:
-					 *	   var g_var = function;
-					 * This is a global variable:
-					 *	   var g_var = different_var_name;
-					 */
-					fulltag = vStringNew ();
-					if (vStringLength (token->scope) > 0)
-					{
-						vStringCopy(fulltag, token->scope);
-						vStringPut (fulltag, '.');
-						vStringCat (fulltag, token->string);
-					}
-					else
-					{
-						vStringCopy(fulltag, token->string);
-					}
-					if ( ! stringListHas(FunctionNames, vStringValue (fulltag)) &&
-							! stringListHas(ClassNames, vStringValue (fulltag)) )
-					{
-						makeJsTag (name, is_const ? JSTAG_CONSTANT : JSTAG_VARIABLE, NULL, NULL);
-					}
-					vStringDelete (fulltag);
-				}
-			}
-			/* Here we should be at the end of the block, on the close curly.
-			 * If so, read the next token not to confuse that close curly with
-			 * the end of the current statement. */
-			if (isType (token, TOKEN_CLOSE_CURLY))
-			{
-				readTokenFull(token, true, NULL);
-				is_terminated = isType (token, TOKEN_SEMICOLON);
-			}
-		}
-		else if (isKeyword (token, KEYWORD_new))
-		{
-			readToken (token);
-			is_var = isType (token, TOKEN_IDENTIFIER);
-			if ( isKeyword (token, KEYWORD_function) ||
-					isKeyword (token, KEYWORD_capital_function) ||
-					isKeyword (token, KEYWORD_capital_object) ||
-					is_var )
-			{
-				if ( isKeyword (token, KEYWORD_capital_object) )
-					is_class = true;
-
-				if (is_var)
-					skipQualifiedIdentifier (token);
-				else
-					readToken (token);
-
-				if ( isType (token, TOKEN_OPEN_PAREN) )
-					skipArgumentList(token, true, NULL);
-
-				if (isType (token, TOKEN_SEMICOLON))
-				{
-					if ( token->nestLevel == 0 )
-					{
-						if ( is_var )
-						{
-							makeJsTag (name, is_const ? JSTAG_CONSTANT : JSTAG_VARIABLE, NULL, NULL);
-						}
-						else if ( is_class )
-						{
-							makeClassTag (name, NULL, NULL);
-						}
-						else
-						{
-							/* FIXME: we cannot really get a meaningful
-							 * signature from a `new Function()` call,
-							 * so for now just don't set any */
-							makeFunctionTag (name, NULL, false);
-						}
-					}
-				}
-				else if (isType (token, TOKEN_CLOSE_CURLY))
-					is_terminated = false;
-			}
-		}
-		else if (! isType (token, TOKEN_KEYWORD))
-		{
-			/*
-			 * Only create variables for global scope
-			 */
-			if ( token->nestLevel == 0 && is_global )
-			{
-				/*
+				 *
 				 * A pointer can be created to the function.
 				 * If we recognize the function/class name ignore the variable.
 				 * This format looks identical to a variable definition.
@@ -2511,38 +2739,159 @@ nextVar:
 				 * This is a global variable:
 				 *	   var g_var = different_var_name;
 				 */
-				fulltag = vStringNew ();
-				if (vStringLength (token->scope) > 0)
-				{
-					vStringCopy(fulltag, token->scope);
-					vStringPut (fulltag, '.');
-					vStringCat (fulltag, token->string);
-				}
-				else
-				{
-					vStringCopy(fulltag, token->string);
-				}
-				if ( ! stringListHas(FunctionNames, vStringValue (fulltag)) &&
-						! stringListHas(ClassNames, vStringValue (fulltag)) )
-				{
-					makeJsTag (name, is_const ? JSTAG_CONSTANT : JSTAG_VARIABLE, NULL, NULL);
-				}
-				vStringDelete (fulltag);
+				indexForName = anyKindsEntryInScope (name->scope, vStringValue (name->string),
+													 (int[]){JSTAG_VARIABLE, JSTAG_FUNCTION, JSTAG_CLASS}, 3, true);
+
+				if (indexForName == CORK_NIL)
+					indexForName = makeJsTag (name, is_const ? JSTAG_CONSTANT : JSTAG_VARIABLE, NULL, NULL);
 			}
+			/* Here we should be at the end of the block, on the close curly.
+			 * If so, read the next token not to confuse that close curly with
+			 * the end of the current statement. */
+			if (isType (token, TOKEN_CLOSE_CURLY))
+			{
+				readTokenFull(token, true, NULL);
+				is_terminated = isType (token, TOKEN_SEMICOLON);
+			}
+		}
+		else if (isType (token, TOKEN_OPEN_SQUARE) && !vStringIsEmpty (name->string))
+		{
+			/*
+			 * Creates tag for an array
+			 */
+			skipArrayList(token, true);
+			jsKind kind = found_this || strchr (vStringValue(name->string), '.') != NULL ? JSTAG_PROPERTY : JSTAG_VARIABLE;
+			/*
+			 * Only create variables for global scope or class/object properties
+			 */
+			if ( ( token->nestLevel == 0 && is_global ) || kind == JSTAG_PROPERTY )
+			{
+				indexForName = makeJsTagCommon (name, kind, NULL, NULL, false);
+			}
+		}
+		else if (isKeyword (token, KEYWORD_new))
+		{
+			readToken (token);
+			is_var = isType (token, TOKEN_IDENTIFIER) || isKeyword (token, KEYWORD_capital_object);
+			if ( isKeyword (token, KEYWORD_function) ||
+					isKeyword (token, KEYWORD_capital_function) ||
+					is_var )
+			{
+				if ( isKeyword (token, KEYWORD_capital_function) && isClassName (name) )
+					is_class = true;
+
+				if ( isType (token, TOKEN_IDENTIFIER) )
+					skipQualifiedIdentifier (token);
+				else
+					readToken (token);
+
+				if ( isType (token, TOKEN_OPEN_PAREN) )
+					skipArgumentList(token, true, NULL);
+
+				if (isType (token, TOKEN_SEMICOLON) && token->nestLevel == 0)
+				{
+					if ( is_var )
+						indexForName = makeJsTag (name, is_const ? JSTAG_CONSTANT : found_this ? JSTAG_PROPERTY : JSTAG_VARIABLE, NULL, NULL);
+					else if ( is_class )
+						indexForName = makeClassTag (name, NULL, NULL);
+					else
+					{
+						/* FIXME: we cannot really get a meaningful
+						 * signature from a `new Function()` call,
+						 * so for now just don't set any */
+						indexForName = makeFunctionTag (name, NULL, false);
+					}
+				}
+				else if (isType (token, TOKEN_CLOSE_CURLY))
+					is_terminated = false;
+			}
+		}
+		else if (! isType (token, TOKEN_KEYWORD) &&
+				 token->nestLevel == 0 && is_global )
+		{
+			/*
+			 * Only create variables for global scope
+			 *
+			 * A pointer can be created to the function.
+			 * If we recognize the function/class name ignore the variable.
+			 * This format looks identical to a variable definition.
+			 * A variable defined outside of a block is considered
+			 * a global variable:
+			 *	   var g_var1 = 1;
+			 *	   var g_var2;
+			 * This is not a global variable:
+			 *	   var g_var = function;
+			 * This is a global variable:
+			 *	   var g_var = different_var_name;
+			 */
+			indexForName = anyKindsEntryInScope (name->scope, vStringValue (name->string),
+												 (int[]){JSTAG_VARIABLE, JSTAG_FUNCTION, JSTAG_CLASS}, 3, true);
+
+			if (indexForName == CORK_NIL)
+			{
+				indexForName = makeJsTag (name, is_const ? JSTAG_CONSTANT : JSTAG_VARIABLE, NULL, NULL);
+				if (isType (token, TOKEN_IDENTIFIER))
+					canbe_arrowfun = true;
+			}
+		}
+		else if ( isType (token, TOKEN_IDENTIFIER) )
+		{
+			canbe_arrowfun = true;
+		}
+
+		if (arrowfun_paren_depth == 0 && canbe_arrowfun)
+		{
+			/* var v = a => { ... } */
+			vString *sig = vStringNewInit ("(");
+			vStringCat (sig, token->string);
+			vStringPut (sig, ')');
+			readTokenFull (token, true, NULL);
+			if (isType (token, TOKEN_ARROW))
+			{
+				if (indexForName == CORK_NIL)	// was not a global variable
+					indexForName = makeFunctionTag (name, sig, false);
+				else
+					convertToFunction (indexForName, vStringValue (sig));
+			}
+			vStringDelete (sig);
 		}
 
 		if (parenDepth > 0)
 		{
+			/* Collect parameters for arrow function. */
+			vString *sig = (arrowfun_paren_depth == 1)? makeVStringForSignature (token): NULL;
+
 			while (parenDepth > 0 && ! isType (token, TOKEN_EOF))
 			{
 				if (isType (token, TOKEN_OPEN_PAREN))
+				{
 					parenDepth++;
+					arrowfun_paren_depth++;
+				}
 				else if (isType (token, TOKEN_CLOSE_PAREN))
+				{
 					parenDepth--;
-				readTokenFull (token, true, NULL);
+					arrowfun_paren_depth--;
+				}
+				readTokenFull (token, true, sig);
+
+				/* var f = (a, b) => { ... } */
+				if (arrowfun_paren_depth == 0 && isType (token, TOKEN_ARROW) && sig)
+				{
+					if (indexForName == CORK_NIL)	// was not a global variable
+						indexForName = makeFunctionTag (name, trimGarbageInSignature (sig), false);
+					else
+						convertToFunction (indexForName,
+										   vStringValue (trimGarbageInSignature (sig)));
+
+					vStringDelete (sig);
+					sig = NULL;
+				}
 			}
 			if (isType (token, TOKEN_CLOSE_CURLY))
 				is_terminated = false;
+
+			vStringDelete (sig); /* NULL is acceptable. */
 		}
 	}
 	/* if we aren't already at the cmd end, advance to it and check whether
@@ -2572,11 +2921,10 @@ nextVar:
 	}
 
 cleanUp:
-	vStringCopy(token->scope, saveScope);
+	token->scope = saveScope;
 	deleteToken (name);
 	deleteToken (secondary_name);
 	deleteToken (method_body_token);
-	vStringDelete(saveScope);
 
 	TRACE_LEAVE();
 
@@ -2606,6 +2954,8 @@ static void parseUI5 (tokenInfo *const token)
 
 	if (isType (token, TOKEN_PERIOD))
 	{
+		int r = CORK_NIL;
+
 		readToken (token);
 		while (! isType (token, TOKEN_OPEN_PAREN) &&
 			   ! isType (token, TOKEN_EOF))
@@ -2623,9 +2973,29 @@ static void parseUI5 (tokenInfo *const token)
 		if (isType (token, TOKEN_COMMA))
 			readToken (token);
 
+		if (isType(name, TOKEN_STRING))
+		{
+			/*
+			 * `name' can include '.'.
+			 * Setting dynamicProp to true can prohibit
+			 * that makeClassTag ispects the inside
+			 * of `name'.
+			 */
+			name->dynamicProp = true;
+			r = makeClassTag (name, NULL, NULL);
+			/*
+			 * TODO
+			 * `name' specifies a class of OpenUI5.
+			 * So tagging it as a language object of
+			 * JavaScript is incorrect. We have to introduce
+			 * OpenUI5 language as a subparser of JavaScript
+			 * to fix this situation.
+			 */
+		}
+
 		do
 		{
-			parseMethods (token, name, false);
+			parseMethods (token, r, false);
 		} while (! isType (token, TOKEN_CLOSE_CURLY) &&
 				 ! isType (token, TOKEN_EOF));
 	}
@@ -2721,85 +3091,99 @@ static void parseJsFile (tokenInfo *const token)
 }
 
 #ifdef DO_TRACING
-#if DO_TRACING_USE_DUMP_TOKEN
+#ifdef DO_TRACING_USE_DUMP_TOKEN
 static void dumpToken (const tokenInfo *const token)
 {
-	fprintf(stderr, "Token <%p>: %s: %s\n",
-			token,
+	const char *scopeStr = getNameStringForCorkIndex (token->scope);
+	const char *scopeKindStr = getKindStringForCorkIndex (token->scope);
+
+	if (strcmp(scopeStr, "placeholder") == 0)
+	{
+		TRACE_PRINT("%s: %s",
 			tokenTypeName (token->type),
-			(token->type == TOKEN_KEYWORD   ? keywordName (token->keyword):
-			 token->type == TOKEN_IDENTIFIER? vStringValue (token->string):
-			 ""));
+			vStringValue (token->string));
+	}
+	else
+	{
+		TRACE_PRINT("%s: %s (scope '%s' of kind %s)",
+			tokenTypeName (token->type),
+			vStringValue (token->string),
+			scopeStr, scopeKindStr);
+	}
 }
 #endif
+
+static const char*
+getNameStringForCorkIndex(int index)
+{
+	if (index == CORK_NIL)
+		return "none";
+	tagEntryInfo *e = getEntryInCorkQueue (index);
+	if (e == NULL)
+		return "ghost";			/* Can this happen? */
+
+	if (e->placeholder)
+		return "placeholder";
+
+	return e->name;
+}
+
+static const char*
+getKindStringForCorkIndex(int index)
+{
+	if (index == CORK_NIL)
+		return "none";
+	tagEntryInfo *e = getEntryInCorkQueue (index);
+	if (e == NULL)
+		return "ghost";			/* Can this happen? */
+
+	if (e->placeholder)
+		return "placeholder";
+
+	if (e->kindIndex == KIND_GHOST_INDEX)
+		return "ghost";
+
+	return JsKinds [e->kindIndex].name;
+}
+
+static const char *kindName(jsKind kind)
+{
+	return ((int)kind) >= 0 ? JsKinds[kind].name : "none";
+}
 
 static const char *tokenTypeName(enum eTokenType e)
-{ /* Generated by misc/enumstr.sh with cmdline "parsers/jscript.c" "eTokenType" "tokenTypeName" */
+{ /* Generated by misc/enumstr.sh with cmdline:
+     parsers/jscript.c eTokenType tokenTypeName */
 	switch (e)
 	{
-		case    TOKEN_BINARY_OPERATOR: return "TOKEN_BINARY_OPERATOR";
-		case          TOKEN_CHARACTER: return "TOKEN_CHARACTER";
-		case        TOKEN_CLOSE_CURLY: return "TOKEN_CLOSE_CURLY";
-		case        TOKEN_CLOSE_PAREN: return "TOKEN_CLOSE_PAREN";
-		case       TOKEN_CLOSE_SQUARE: return "TOKEN_CLOSE_SQUARE";
-		case              TOKEN_COLON: return "TOKEN_COLON";
-		case              TOKEN_COMMA: return "TOKEN_COMMA";
-		case                TOKEN_EOF: return "TOKEN_EOF";
-		case         TOKEN_EQUAL_SIGN: return "TOKEN_EQUAL_SIGN";
-		case         TOKEN_IDENTIFIER: return "TOKEN_IDENTIFIER";
-		case            TOKEN_KEYWORD: return "TOKEN_KEYWORD";
-		case         TOKEN_OPEN_CURLY: return "TOKEN_OPEN_CURLY";
-		case         TOKEN_OPEN_PAREN: return "TOKEN_OPEN_PAREN";
-		case        TOKEN_OPEN_SQUARE: return "TOKEN_OPEN_SQUARE";
-		case             TOKEN_PERIOD: return "TOKEN_PERIOD";
-		case   TOKEN_POSTFIX_OPERATOR: return "TOKEN_POSTFIX_OPERATOR";
-		case             TOKEN_REGEXP: return "TOKEN_REGEXP";
-		case          TOKEN_SEMICOLON: return "TOKEN_SEMICOLON";
-		case               TOKEN_STAR: return "TOKEN_STAR";
-		case             TOKEN_STRING: return "TOKEN_STRING";
-		case    TOKEN_TEMPLATE_STRING: return "TOKEN_TEMPLATE_STRING";
-		case          TOKEN_UNDEFINED: return "TOKEN_UNDEFINED";
-		default: return "UNKNOWN";
+		case      TOKEN_UNDEFINED: return "TOKEN_UNDEFINED";
+		case            TOKEN_EOF: return "TOKEN_EOF";
+		case      TOKEN_CHARACTER: return "TOKEN_CHARACTER";
+		case    TOKEN_CLOSE_PAREN: return "TOKEN_CLOSE_PAREN";
+		case      TOKEN_SEMICOLON: return "TOKEN_SEMICOLON";
+		case          TOKEN_COLON: return "TOKEN_COLON";
+		case          TOKEN_COMMA: return "TOKEN_COMMA";
+		case        TOKEN_KEYWORD: return "TOKEN_KEYWORD";
+		case     TOKEN_OPEN_PAREN: return "TOKEN_OPEN_PAREN";
+		case     TOKEN_IDENTIFIER: return "TOKEN_IDENTIFIER";
+		case         TOKEN_STRING: return "TOKEN_STRING";
+		case TOKEN_TEMPLATE_STRING: return "TOKEN_TEMPLATE_STRING";
+		case         TOKEN_PERIOD: return "TOKEN_PERIOD";
+		case     TOKEN_OPEN_CURLY: return "TOKEN_OPEN_CURLY";
+		case    TOKEN_CLOSE_CURLY: return "TOKEN_CLOSE_CURLY";
+		case     TOKEN_EQUAL_SIGN: return "TOKEN_EQUAL_SIGN";
+		case    TOKEN_OPEN_SQUARE: return "TOKEN_OPEN_SQUARE";
+		case   TOKEN_CLOSE_SQUARE: return "TOKEN_CLOSE_SQUARE";
+		case         TOKEN_REGEXP: return "TOKEN_REGEXP";
+		case TOKEN_POSTFIX_OPERATOR: return "TOKEN_POSTFIX_OPERATOR";
+		case           TOKEN_STAR: return "TOKEN_STAR";
+		case         TOKEN_ATMARK: return "TOKEN_ATMARK";
+		case TOKEN_BINARY_OPERATOR: return "TOKEN_BINARY_OPERATOR";
+		case          TOKEN_ARROW: return "TOKEN_ARROW";
+		case           TOKEN_DOTS: return "TOKEN_DOTS";
+		default:                   return "UNKNOWN";
 	}
 }
-
-#if DO_TRACING_USE_DUMP_TOKEN
-static const char *keywordName(enum eKeywordId e)
-{ /* Generated by misc/enumstr.sh with cmdline "parsers/jscript.c" "eKeywordId" "keywordName" */
-	switch (e)
-	{
-		case            KEYWORD_async: return "KEYWORD_async";
-		case KEYWORD_capital_function: return "KEYWORD_capital_function";
-		case   KEYWORD_capital_object: return "KEYWORD_capital_object";
-		case            KEYWORD_catch: return "KEYWORD_catch";
-		case            KEYWORD_class: return "KEYWORD_class";
-		case            KEYWORD_const: return "KEYWORD_const";
-		case          KEYWORD_default: return "KEYWORD_default";
-		case               KEYWORD_do: return "KEYWORD_do";
-		case             KEYWORD_else: return "KEYWORD_else";
-		case           KEYWORD_export: return "KEYWORD_export";
-		case          KEYWORD_extends: return "KEYWORD_extends";
-		case          KEYWORD_finally: return "KEYWORD_finally";
-		case              KEYWORD_for: return "KEYWORD_for";
-		case         KEYWORD_function: return "KEYWORD_function";
-		case              KEYWORD_get: return "KEYWORD_get";
-		case               KEYWORD_if: return "KEYWORD_if";
-		case              KEYWORD_let: return "KEYWORD_let";
-		case              KEYWORD_new: return "KEYWORD_new";
-		case        KEYWORD_prototype: return "KEYWORD_prototype";
-		case           KEYWORD_return: return "KEYWORD_return";
-		case              KEYWORD_sap: return "KEYWORD_sap";
-		case              KEYWORD_set: return "KEYWORD_set";
-		case           KEYWORD_static: return "KEYWORD_static";
-		case           KEYWORD_switch: return "KEYWORD_switch";
-		case             KEYWORD_this: return "KEYWORD_this";
-		case              KEYWORD_try: return "KEYWORD_try";
-		case              KEYWORD_var: return "KEYWORD_var";
-		case            KEYWORD_while: return "KEYWORD_while";
-		default: return "UNKNOWN";
-	}
-}
-#endif
 #endif
 
 static void initialize (const langType language)
@@ -2823,16 +3207,10 @@ static void findJsTags (void)
 	tokenInfo *const token = newToken ();
 
 	NextToken = NULL;
-	ClassNames = stringListNew ();
-	FunctionNames = stringListNew ();
 	LastTokenType = TOKEN_UNDEFINED;
 
 	parseJsFile (token);
 
-	stringListDelete (ClassNames);
-	stringListDelete (FunctionNames);
-	ClassNames = NULL;
-	FunctionNames = NULL;
 	deleteToken (token);
 
 #ifdef HAVE_ICONV
@@ -2872,6 +3250,8 @@ extern parserDefinition* JavaScriptParser (void)
 	def->finalize   = finalize;
 	def->keywordTable = JsKeywordTable;
 	def->keywordCount = ARRAY_SIZE (JsKeywordTable);
+	def->useCork	= CORK_QUEUE|CORK_SYMTAB;
+	def->requestAutomaticFQTag = true;
 
 	return def;
 }

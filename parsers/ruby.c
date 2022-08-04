@@ -133,7 +133,7 @@ static vString* nestingLevelsToScope (const NestingLevels* nls)
 * it was) otherwise.
 */
 static bool canMatch (const unsigned char** s, const char* literal,
-                         bool (*end_check) (int))
+					  bool (*end_check) (int))
 {
 	const int literal_length = strlen (literal);
 	const int s_length = strlen ((const char *)*s);
@@ -316,9 +316,9 @@ static int emitRubyTagFull (vString* name, rubyKind kind, bool pushLevel, bool c
 		anonymous = true;
 	}
 
-        if (!RubyKinds[kind].enabled) {
-            return CORK_NIL;
-        }
+	if (!RubyKinds[kind].enabled) {
+		return CORK_NIL;
+	}
 
 	scope = nestingLevelsToScope (nesting);
 	lvl = nestingLevelsGetCurrent (nesting);
@@ -397,12 +397,33 @@ extern void rubySkipWhitespace (const unsigned char** cp)
 	}
 }
 
+static void parseString (const unsigned char** cp, unsigned char boundary, vString* vstr)
+{
+	while (**cp != 0 && **cp != boundary)
+	{
+		if (vstr)
+			vStringPut (vstr, **cp);
+		++*cp;
+	}
+
+	/* skip the last found '"' */
+	if (**cp == boundary)
+		++*cp;
+}
+
+extern bool rubyParseString (const unsigned char** cp, unsigned char boundary, vString* vstr)
+{
+	const unsigned char *p = *cp;
+	parseString (cp, boundary, vstr);
+	return (p != *cp);
+}
+
 /*
 * Copies the characters forming an identifier from *cp into
 * name, leaving *cp pointing to the character after the identifier.
 */
 static rubyKind parseIdentifier (
-		const unsigned char** cp, vString* name, rubyKind kind)
+	const unsigned char** cp, vString* name, rubyKind kind)
 {
 	/* Method names are slightly different to class and variable names.
 	 * A method name may optionally end with a question mark, exclamation
@@ -442,6 +463,20 @@ static rubyKind parseIdentifier (
 	}
 
 	/* Copy the identifier into 'name'. */
+	if (**cp == ':' && (*((*cp) + 1) == '"' || *((*cp) + 1) == '\''))
+	{
+		/* The symbol is defined with string literal like:
+		   ----
+		   :"[]"
+		   :"[]="
+		   ----
+		*/
+		unsigned char b = *(++*cp);
+		++*cp;
+		parseString (cp, b, name);
+		return kind;
+	}
+
 	while (**cp != 0 && (**cp == ':' || isIdentChar (**cp) || charIsIn (**cp, also_ok)))
 	{
 		char last_char = **cp;
@@ -489,27 +524,6 @@ extern bool rubyParseMethodName (const unsigned char **cp, vString* vstr)
 extern bool rubyParseModuleName (const unsigned char **cp, vString* vstr)
 {
 	return (parseIdentifier (cp, vstr, K_MODULE) == K_MODULE);
-}
-
-static void parseString (const unsigned char** cp, unsigned char boundary, vString* vstr)
-{
-	while (**cp != 0 && **cp != boundary)
-	{
-		if (vstr)
-			vStringPut (vstr, **cp);
-		++*cp;
-	}
-
-	/* skip the last found '"' */
-	if (**cp == boundary)
-		++*cp;
-}
-
-extern bool rubyParseString (const unsigned char** cp, unsigned char boundary, vString* vstr)
-{
-	const unsigned char *p = *cp;
-	parseString (cp, boundary, vstr);
-	return (p != *cp);
 }
 
 static void parseSignature (const unsigned char** cp, vString* vstr)
@@ -727,7 +741,7 @@ static void deleteBlockData (NestingLevel *nl, void *data CTAGS_ATTR_UNUSED)
 
 	tagEntryInfo *e = getEntryInCorkQueue (nl->corkIndex);
 	if (e && !e->placeholder)
-			e->extensionFields.endLine = getInputLineNumber ();
+		e->extensionFields.endLine = getInputLineNumber ();
 
 	tagEntryInfo *sub_e;
 	if (bdata->subparserCorkIndex != CORK_NIL
