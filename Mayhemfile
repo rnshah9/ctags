@@ -5,3 +5,4 @@ testsuite:
 
 cmds:
   - cmd: /install/bin/ctags @@
+    filepath: /test.pp
